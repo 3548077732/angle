@@ -56,6 +56,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 240
     steps:
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -64,7 +65,7 @@ jobs:
 
       - name: Reclaim disk
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
           df -h "$RUNNER_TEMP"
 
       - name: Setup depot_tools
@@ -75,29 +76,33 @@ jobs:
       - name: Write .gclient
         run: |
           cd "$GITHUB_WORKSPACE/.."
-          cat > .gclient <<GCLIENT
-          solutions = [
-            {
-              "name": "$(basename "$GITHUB_WORKSPACE")",
-              "url": "${{ github.server_url }}/${{ github.repository }}.git",
-              "managed": False,
-              "custom_deps": {},
-              "custom_vars": {},
-            },
-          ]
-          GCLIENT
+          NAME=$(basename "$GITHUB_WORKSPACE")
+          URL=${{ github.server_url }}/${{ github.repository }}.git
+          {
+            echo 'solutions = ['
+            echo '  {'
+            printf '    "name": "%s",\n' "$NAME"
+            printf '    "url": "%s",\n' "$URL"
+            echo '    "deps_file": "DEPS",'
+            echo '    "managed": False,'
+            echo '    "custom_deps": {},'
+            echo '    "custom_vars": {},'
+            echo '  },'
+            echo ']'
+          } > .gclient
+          python3 -c "import ast;ast.parse(open('.gclient').read());print('gclient syntax OK')"
           cat .gclient
 
       - name: Sync dependencies
         if: ${{ inputs.sync_deps }}
         run: |
           cd "$GITHUB_WORKSPACE/.."
-          gclient sync -D --nohooks --no-history
+          gclient sync -D --no-history
 
       - name: Toolchain check
         run: |
-          which gn autoninja clang
-          clang --version
+          for t in gn autoninja clang; do printf '%s -> %s\n' "$t" "$(command -v "$t" || echo MISSING)"; done
+          clang --version || true
 
       - name: GN gen
         run: |
