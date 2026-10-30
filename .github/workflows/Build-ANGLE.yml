@@ -1,0 +1,177 @@
+name: ANGLE 进阶构建流水线
+
+on:
+  push:
+    branches: [ main, master ]
+    paths-ignore:
+      - '**.md'
+      - 'doc/**'
+  pull_request:
+    branches: [ main, master ]
+    paths-ignore:
+      - '**.md'
+      - 'doc/**'
+  # 带参数的手动触发
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 构建类型
+        type: choice
+        required: true
+        default: Release
+        options:
+          - Release
+          - Debug
+      target_arch:
+        description: 目标架构
+        type: choice
+        required: true
+        default: x64
+        options:
+          - x64
+          - arm64
+      enable_vulkan:
+        description: 启用 Vulkan 渲染后端
+        type: boolean
+        required: false
+        default: true
+      run_tests:
+        description: 构建完成后运行单元测试
+        type: boolean
+        required: false
+        default: false
+      build_platforms:
+        description: 构建平台
+        type: choice
+        required: true
+        default: all
+        options:
+          - all
+          - ubuntu
+          - windows
+          - macos
+
+jobs:
+  # 生成动态构建矩阵：根据手动输入选择构建平台
+  generate-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      os_matrix: ${{ steps.set_matrix.outputs.os_matrix }}
+    steps:
+      - id: set_matrix
+        shell: bash
+        run: |
+          if [ "${{ github.event.inputs.build_platforms }}" = "all" ] || [ -z "${{ github.event.inputs.build_platforms }}" ]; then
+            os_list='["ubuntu-latest", "windows-latest", "macos-latest"]'
+          else
+            os_list="[\"${{ github.event.inputs.build_platforms }}-latest\"]"
+          fi
+          echo "os_matrix=$os_list" >> $GITHUB_OUTPUT
+
+  build:
+    needs: generate-matrix
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJson(needs.generate-matrix.outputs.os_matrix) }}
+
+    env:
+      BUILD_TYPE: ${{ github.event.inputs.build_type || 'Release' }}
+      TARGET_ARCH: ${{ github.event.inputs.target_arch || 'x64' }}
+      ENABLE_VULKAN: ${{ github.event.inputs.enable_vulkan || true }}
+      RUN_TESTS: ${{ github.event.inputs.run_tests || false }}
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: 配置 Python 环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # 缓存 depot_tools，加速后续构建
+      - name: 缓存 depot_tools
+        uses: actions/cache@v4
+        id: cache-depot-tools
+        with:
+          path: depot_tools
+          key: ${{ runner.os }}-depot-tools
+
+      - name: 安装 depot_tools (Linux/macOS)
+        if: runner.os != 'Windows' && steps.cache-depot-tools.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git
+          echo "$PWD/depot_tools" >> $GITHUB_PATH
+
+      - name: 安装 depot_tools (Windows)
+        if: runner.os == 'Windows' && steps.cache-depot-tools.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git
+          echo "$PWD/depot_tools" >> $GITHUB_PATH
+
+      - name: 将 depot_tools 加入环境变量
+        shell: bash
+        run: echo "$PWD/depot_tools" >> $GITHUB_PATH
+
+      - name: 同步项目第三方依赖
+        shell: bash
+        run: gclient sync
+
+      - name: 拼接 GN 构建参数（分平台适配）
+        shell: bash
+        id: gn_args
+        run: |
+          IS_DEBUG="false"
+          if [ "$BUILD_TYPE" = "Debug" ]; then
+            IS_DEBUG="true"
+          fi
+
+          # 基础参数
+          GN_ARGS="is_debug=${IS_DEBUG} target_cpu=\"${TARGET_ARCH}\" is_component_build=true"
+          GN_ARGS="${GN_ARGS} angle_enable_vulkan=${ENABLE_VULKAN}"
+
+          # 分平台追加专属后端
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            GN_ARGS="${GN_ARGS} angle_enable_d3d9=true angle_enable_d3d11=true"
+          elif [ "$RUNNER_OS" = "macOS" ]; then
+            GN_ARGS="${GN_ARGS} angle_enable_metal=true angle_enable_gl=false"
+          elif [ "$RUNNER_OS" = "Linux" ]; then
+            GN_ARGS="${GN_ARGS} angle_enable_gl=true"
+          fi
+
+          echo "args=${GN_ARGS}" >> $GITHUB_OUTPUT
+
+      - name: 生成 Ninja 构建配置
+        shell: bash
+        run: gn gen out/${{ env.BUILD_TYPE }} --args='${{ steps.gn_args.outputs.args }}'
+
+      - name: 执行编译
+        shell: bash
+        run: ninja -C out/${{ env.BUILD_TYPE }} -j $(( $(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4) ))
+
+      - name: 运行单元测试（可选）
+        if: env.RUN_TESTS == 'true' && env.TARGET_ARCH == 'x64'
+        shell: bash
+        run: |
+          cd out/${{ env.BUILD_TYPE }}
+          ./angle_unittests
+
+      - name: 打包核心构建产物
+        shell: bash
+        run: |
+          mkdir -p artifact-${RUNNER_OS}-${TARGET_ARCH}-${BUILD_TYPE}
+          cp out/${BUILD_TYPE}/libGLESv2.* artifact-${RUNNER_OS}-${TARGET_ARCH}-${BUILD_TYPE}/ 2>/dev/null || true
+          cp out/${BUILD_TYPE}/libEGL.* artifact-${RUNNER_OS}-${TARGET_ARCH}-${BUILD_TYPE}/ 2>/dev/null || true
+          cp out/${BUILD_TYPE}/angleinfo* artifact-${RUNNER_OS}-${TARGET_ARCH}-${BUILD_TYPE}/ 2>/dev/null || true
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: angle-${{ runner.os }}-${{ env.TARGET_ARCH }}-${{ env.BUILD_TYPE }}-${{ github.sha }}
+          path: artifact-${{ runner.os }}-${{ env.TARGET_ARCH }}-${{ env.BUILD_TYPE }}/
