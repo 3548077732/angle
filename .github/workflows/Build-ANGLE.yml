@@ -11,7 +11,6 @@ on:
     paths-ignore:
       - '**.md'
       - 'doc/**'
-  # 带参数的手动触发
   workflow_dispatch:
     inputs:
       build_type:
@@ -52,7 +51,6 @@ on:
           - macos
 
 jobs:
-  # 生成动态构建矩阵：根据手动输入选择构建平台
   generate-matrix:
     runs-on: ubuntu-latest
     outputs:
@@ -85,15 +83,12 @@ jobs:
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
 
       - name: 配置 Python 环境
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      # 缓存 depot_tools，加速后续构建
       - name: 缓存 depot_tools
         uses: actions/cache@v4
         id: cache-depot-tools
@@ -119,9 +114,28 @@ jobs:
         shell: bash
         run: echo "$PWD/depot_tools" >> $GITHUB_PATH
 
-      - name: 同步项目第三方依赖
+      # 关键修复：跳过私有内部子模块，仅初始化公开子模块
+      - name: 初始化公开子模块
         shell: bash
-        run: gclient sync
+        run: |
+          git submodule init
+          # 卸载指向谷歌内部仓库的子模块
+          git submodule deinit -f third_party/gles1_conform 2>/dev/null || true
+          # 更新其余公开子模块
+          git submodule update --init --recursive --recommend-shallow
+
+      # 关键修复：配置 gclient 并跳过内部私有依赖
+      - name: 同步公开项目依赖
+        shell: bash
+        run: |
+          gclient config --name . --unmanaged https://github.com/3548077732/angle.git
+          # 排除内部受限依赖，仅拉取公开可访问的依赖
+          gclient sync --nohooks --no-history \
+            --custom-deps='third_party/gles1_conform@None'
+
+      - name: 执行 gclient hooks
+        shell: bash
+        run: gclient runhooks
 
       - name: 拼接 GN 构建参数（分平台适配）
         shell: bash
@@ -132,11 +146,9 @@ jobs:
             IS_DEBUG="true"
           fi
 
-          # 基础参数
           GN_ARGS="is_debug=${IS_DEBUG} target_cpu=\"${TARGET_ARCH}\" is_component_build=true"
           GN_ARGS="${GN_ARGS} angle_enable_vulkan=${ENABLE_VULKAN}"
 
-          # 分平台追加专属后端
           if [ "$RUNNER_OS" = "Windows" ]; then
             GN_ARGS="${GN_ARGS} angle_enable_d3d9=true angle_enable_d3d11=true"
           elif [ "$RUNNER_OS" = "macOS" ]; then
@@ -155,7 +167,7 @@ jobs:
         shell: bash
         run: ninja -C out/${{ env.BUILD_TYPE }} -j $(( $(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4) ))
 
-      - name: 运行单元测试（可选）
+      - name: 运行单元测试（可选，仅 x64）
         if: env.RUN_TESTS == 'true' && env.TARGET_ARCH == 'x64'
         shell: bash
         run: |
