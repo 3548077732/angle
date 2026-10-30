@@ -1,1 +1,152 @@
+name: build-manual
 
+on:
+  workflow_dispatch:
+    inputs:
+      git_ref:
+        description: "Ref to build"
+        required: true
+        default: "main"
+        type: string
+      gn_target:
+        description: "GN target"
+        required: true
+        default: "angle_shader_translator"
+        type: choice
+        options:
+          - "angle_shader_translator"
+          - "libEGL"
+          - "libGLESv2"
+          - "angle_unittests"
+          - "angle_end2end_tests"
+      build_type:
+        description: "Build type"
+        required: true
+        default: "release"
+        type: choice
+        options:
+          - "release"
+          - "debug"
+      sync_deps:
+        description: "Run gclient sync"
+        required: true
+        default: true
+        type: boolean
+      run_tests:
+        description: "Run tests after build"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-manual-${{ github.repository_id }}-${{ inputs.git_ref }}
+  cancel-in-progress: false
+
+env:
+  DEPOT_TOOLS_UPDATE: "0"
+  DEPOT_TOOLS_WIN_TOOLCHAIN: "0"
+  GYP_CHROMIUM_NO_ACTION: "1"
+
+jobs:
+  build:
+    name: ${{ inputs.gn_target }}-${{ inputs.build_type }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.git_ref }}
+          fetch-depth: 1
+
+      - name: Reclaim disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h "$RUNNER_TEMP"
+
+      - name: Setup depot_tools
+        run: |
+          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$RUNNER_TEMP/depot_tools"
+          echo "$RUNNER_TEMP/depot_tools" >> "$GITHUB_PATH"
+
+      - name: Write .gclient
+        run: |
+          cd "$GITHUB_WORKSPACE/.."
+          cat > .gclient <<GCLIENT
+          solutions = [
+            {
+              "name": "$(basename "$GITHUB_WORKSPACE")",
+              "url": "${{ github.server_url }}/${{ github.repository }}.git",
+              "managed": False,
+              "custom_deps": {},
+              "custom_vars": {},
+            },
+          ]
+          GCLIENT
+          cat .gclient
+
+      - name: Sync dependencies
+        if: ${{ inputs.sync_deps }}
+        run: |
+          cd "$GITHUB_WORKSPACE/.."
+          gclient sync -D --nohooks --no-history
+
+      - name: Toolchain check
+        run: |
+          which gn autoninja clang
+          clang --version
+
+      - name: GN gen
+        run: |
+          if [ "${{ inputs.build_type }}" = "debug" ]; then
+            ARGS="is_debug=true symbol_level=1"
+          else
+            ARGS="is_debug=false symbol_level=0"
+          fi
+          ARGS="$ARGS is_component_build=false is_clang=true use_lld=true treat_warnings_as_errors=false angle_enable_null=true"
+          gn gen "out/${{ inputs.build_type }}" --args="$ARGS"
+
+      - name: Build
+        run: autoninja -C "out/${{ inputs.build_type }}" "${{ inputs.gn_target }}"
+
+      - name: Test
+        if: ${{ inputs.run_tests }}
+        run: |
+          BIN="out/${{ inputs.build_type }}/${{ inputs.gn_target }}"
+          if [ -x "$BIN" ]; then
+            "$BIN" --gtest_brief=1
+          else
+            echo "target is not a runnable test binary, skipped"
+          fi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: angle-${{ inputs.gn_target }}-${{ inputs.build_type }}
+          path: |
+            out/**/angle_shader_translator
+            out/**/libEGL.so
+            out/**/libGLESv2.so
+            out/**/angle_unittests
+            out/**/angle_end2end_tests
+            out/**/*.a
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Summary
+        run: |
+          HEAD_SHA=$(git rev-parse HEAD)
+          OUT_SIZE=$(du -sh "out/${{ inputs.build_type }}" | cut -f1)
+          {
+            echo "### build-manual"
+            echo "| item | value |"
+            echo "|---|---|"
+            echo "| ref | ${{ inputs.git_ref }} |"
+            echo "| commit | $HEAD_SHA |"
+            echo "| target | ${{ inputs.gn_target }} |"
+            echo "| type | ${{ inputs.build_type }} |"
+            echo "| out size | $OUT_SIZE |"
+          } >> "$GITHUB_STEP_SUMMARY"
